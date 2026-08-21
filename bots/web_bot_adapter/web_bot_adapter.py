@@ -29,6 +29,11 @@ from .ui_methods import UiAuthorizedUserNotInMeetingTimeoutExceededException, Ui
 
 logger = logging.getLogger(__name__)
 
+# lanh patch: how long init() waits for the websocket server to bind before
+# calling the bot a failure. Generous on purpose — the cost of waiting is a
+# slow start, the cost of giving up early is a meeting nobody captures.
+WEBSOCKET_SERVER_START_TIMEOUT_SECONDS = 30
+
 
 class WebBotAdapter(BotAdapter):
     def __init__(
@@ -93,6 +98,8 @@ class WebBotAdapter(BotAdapter):
         self.websocket_port = None
         self.websocket_server = None
         self.websocket_thread = None
+        # lanh patch: set once the server is bound and its port is known.
+        self.websocket_ready = threading.Event()
         self.last_websocket_message_processed_time = None
         self.last_media_message_processed_time = None
         self.last_audio_message_processed_time = None
@@ -461,30 +468,37 @@ class WebBotAdapter(BotAdapter):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-        port = self.get_websocket_port()
-        max_retries = 10
-
-        for attempt in range(max_retries):
-            try:
-                self.websocket_server = serve(
-                    self.handle_websocket,
-                    "localhost",
-                    port,
-                    compression=None,
-                    max_size=None,
-                )
-                logger.info(f"Websocket server started on ws://localhost:{port}")
-                self.websocket_port = port
-                self.websocket_server.serve_forever()
-                break
-            except OSError as e:
-                if e.errno == 98:  # Address already in use
-                    logger.info(f"Port {port} is already in use, trying next port...")
-                    port += 1
-                    if attempt == max_retries - 1:
-                        raise Exception(f"Could not find available port after {max_retries} attempts")
-                    continue
-                raise  # Re-raise other OSErrors
+        # lanh patch: ask the kernel for a free port instead of scanning a fixed
+        # ten from a hardcoded base. Bots run as celery tasks inside one shared
+        # container, so every bot competes for the same ports on one localhost.
+        # cleanup() does shut this server down, but only on the paths that reach
+        # it: a bot that dies without cleaning up leaves its port listening for
+        # the life of the worker child, and those accumulate until the range is
+        # gone for good. After that, a bot launched while another holds the last
+        # free port dies here — which the caller reads as a failed capture and
+        # retries, so a call overlapping another is joined only once the other
+        # bot leaves.
+        #
+        # A fixed range only moves that day further out; an ephemeral port
+        # removes it. The kernel never hands out a busy port, so there is nothing
+        # to exhaust and no retry to get wrong, and a leaked server costs one
+        # stray socket instead of a share of a scarce range. The browser is told
+        # the real port through window.initialData.websocketPort, so nothing
+        # downstream depends on a fixed number.
+        self.websocket_server = serve(
+            self.handle_websocket,
+            "localhost",
+            0,
+            compression=None,
+            max_size=None,
+        )
+        # Read the bound port back off the socket rather than storing what was
+        # asked for: 0 means "any", and it is also falsy, so storing it would
+        # trip init()'s readiness check and report a healthy server as a failure.
+        self.websocket_port = self.websocket_server.socket.getsockname()[1]
+        logger.info(f"Websocket server started on ws://localhost:{self.websocket_port}")
+        self.websocket_ready.set()
+        self.websocket_server.serve_forever()
 
     def send_request_to_join_denied_message(self):
         self.send_message_callback({"message": self.Messages.REQUEST_TO_JOIN_DENIED, "remover": self.remover})
@@ -710,8 +724,11 @@ class WebBotAdapter(BotAdapter):
         websocket_thread = threading.Thread(target=self.run_websocket_server, daemon=True)
         websocket_thread.start()
 
-        sleep(0.5)  # Give the websocketserver time to start
-        if not self.websocket_port:
+        # lanh patch: wait for the bind instead of sleeping a fixed half second.
+        # The old sleep was a race — a worker busy with another bot's Chrome could
+        # miss the window and a server that was coming up fine was called a
+        # failure. The event is set by run_websocket_server once the port is known.
+        if not self.websocket_ready.wait(timeout=WEBSOCKET_SERVER_START_TIMEOUT_SECONDS):
             raise Exception("WebSocket server failed to start")
 
         repeatedly_attempt_to_join_meeting_thread = threading.Thread(target=self.repeatedly_attempt_to_join_meeting, daemon=True)
