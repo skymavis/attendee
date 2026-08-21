@@ -3,7 +3,7 @@ import os
 from .base import *
 
 DEBUG = True
-SITE_DOMAIN = "localhost:8000"
+SITE_DOMAIN = os.getenv("SITE_DOMAIN", "localhost:8000")
 ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "localhost").split(",")
 
 DATABASES = {
