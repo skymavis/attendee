@@ -1,5 +1,10 @@
 services:
   attendee-worker-local:
+    # Lets the bot reach this deployment's own public hostname from inside
+    # the container (it is served by a reverse proxy on the host). Unset,
+    # the alias is inert.
+    extra_hosts:
+      - "${ATTENDEE_HOST_ALIAS:-attendee.localhost}:host-gateway"
     build: ./
     volumes:
      - .:/attendee
