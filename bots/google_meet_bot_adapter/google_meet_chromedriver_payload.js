@@ -1970,6 +1970,69 @@ const handleVideoTrack = async (event) => {
   }
 };
 
+// lanh probe: what getContributingSources() actually returns on a Meet
+// receiver, sampled once a second per audio receiver and sent to the bot's
+// log as JSON. Logging only; it changes no label. Two readings of the same
+// receiver ride each sample: the cached list the labelling rule reads (as
+// refreshed by Meet's own polling) and a live read, each entry with its
+// source id, level, age against the spec clock, and the participant it maps
+// to — beside the receiver's own current peak. Whether a quiet receiver lists
+// the loud speaker at age ~0 (levels are global) or only its own quiet
+// occupant plus stale entries (levels are per receiver) is what decides how a
+// frame may be labelled. The live read also refreshes the cache through the
+// interceptor, so while this runs the cache is at most a second old.
+class ContributingSourcesProbe {
+    constructor() {
+        this.peaks = new WeakMap();
+        this.lastPeakAt = new WeakMap();
+    }
+
+    notePeak(receiver, peak) {
+        const prev = this.peaks.get(receiver) || 0;
+        this.peaks.set(receiver, Math.max(prev, peak));
+    }
+
+    start(intervalMs = 1000) {
+        setInterval(() => {
+            try { this.sample(); } catch (e) { console.error('contributing sources probe', e); }
+        }, intervalMs);
+    }
+
+    describe(sources, absNow) {
+        return (sources || []).map(s => ({
+            src: s.source,
+            level: Math.round((s.audioLevel || 0) * 1000) / 1000,
+            age: Math.round(absNow - (s.timestamp || 0)),
+            user: (userManager.getUserByStreamId(String(s.source))?.deviceId || '').slice(-4) || null,
+        }));
+    }
+
+    sample() {
+        const absNow = performance.timeOrigin + performance.now();
+        let index = 0;
+        for (const [receiver, cached] of receiverManager.receiverMap) {
+            if (receiver?.track?.kind !== 'audio') continue;
+            const peak = this.peaks.get(receiver) || 0;
+            this.peaks.set(receiver, 0);
+            const cachedList = this.describe(cached, absNow);
+            const live = this.describe(receiver.getContributingSources(), absNow);
+            const sync = this.describe(receiver.getSynchronizationSources(), absNow);
+            ws.sendJson({
+                type: 'ContributingSourcesSample',
+                receiver: index++,
+                peak: Math.round(peak * 1000) / 1000,
+                cached: cachedList,
+                live,
+                sync,
+            });
+        }
+    }
+}
+const contributingSourcesProbe = new ContributingSourcesProbe();
+if (window.initialData.sendPerParticipantAudio) {
+    contributingSourcesProbe.start();
+}
+
 const handleAudioTrack = async (event) => {
   let lastAudioFormat = null;  // Track last seen format
   
@@ -2055,6 +2118,14 @@ const handleAudioTrack = async (event) => {
                 if (audioData.every(value => value === 0)) {
                     return;
                 }
+
+                // lanh probe: what this receiver carries right now, for the sampler below.
+                let probePeak = 0;
+                for (let i = 0; i < audioData.length; i++) {
+                    const v = audioData[i] < 0 ? -audioData[i] : audioData[i];
+                    if (v > probePeak) probePeak = v;
+                }
+                contributingSourcesProbe.notePeak(receiver, probePeak);
 
                 const contributingSources = receiverManager.getContributingSources(receiver);
 
