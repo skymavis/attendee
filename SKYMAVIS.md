@@ -43,6 +43,19 @@ there from a stack trace finds the reason without consulting this file.
   free port died at startup — so a meeting overlapping another was joined only
   once the other bot left. Both this and the readiness-event change beside it
   are upstreamable; offering them is the cheapest way to shrink this branch.
+- **`fix(bots)`: a Meet audio frame is labelled by who is contributing to its
+  receiver now.** Meet gives the bot three continuous audio receivers, and the
+  per-participant stream labelled each receiver's frame with the loudest source
+  in `getContributingSources()` — a ten-second history, read from a cache Meet's
+  own UI refreshes. So a speaker was stamped on two or three receivers at once
+  and reached the consumer at up to two and a half times real time, mostly as
+  another receiver's quiet audio under their name; downstream that overran a
+  real-time recogniser until it stopped reading. The sources are now read live
+  per frame, kept only if heard within a few packets of the newest, and a
+  participant chosen on two receivers in the same instant is sent from one.
+  Verifiable on any call from the consumer's side: per-participant frames per
+  minute must not exceed real time while the total across labels stays at
+  three receivers' worth. Likely upstreamable.
 
 ## Deploying
 

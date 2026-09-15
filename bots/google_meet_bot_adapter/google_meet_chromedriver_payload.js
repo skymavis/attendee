@@ -2130,6 +2130,54 @@ const handleVideoTrack = async (event) => {
   }
 };
 
+// lanh patch: see the labelling block in handleAudioTrack. How far behind the
+// newest source on a receiver a source may be and still count as contributing
+// to the current frame: a couple of 20 ms packets, so ordinary jitter between
+// the sources of one mixed receiver does not drop one of them, while a source
+// that stopped a second ago does not label what replaced it.
+const CONTRIBUTING_SOURCE_RECENCY_MS = 50;
+
+// lanh patch: reading a receiver's sources is a blocking hop to the signalling
+// thread in Chromium, and a receiver delivers two 10 ms frames per 20 ms
+// packet, so the read is shared by frames that land within one packet of
+// each other rather than repeated for every frame.
+const CONTRIBUTING_SOURCE_READ_INTERVAL_MS = 10;
+const contributingSourcesReadAt = new WeakMap();  // receiver -> { at, sources }
+
+function currentContributingSources(receiver) {
+    const now = performance.now();
+    const cached = contributingSourcesReadAt.get(receiver);
+    if (cached && now - cached.at < CONTRIBUTING_SOURCE_READ_INTERVAL_MS) {
+        return cached.sources;
+    }
+    const sources = receiver.getContributingSources();
+    contributingSourcesReadAt.set(receiver, { at: now, sources });
+    return sources;
+}
+
+// lanh patch: one voice per participant. Meet can forward the same person on
+// more than one receiver at once; the first receiver to send them holds them
+// until it has been silent about them for longer than a packet with jitter,
+// so the copies collapse to one stream at real time instead of interleaving
+// and the hold does not flip on every late packet.
+class PerParticipantAudioOwner {
+    constructor(holdMs = 40) {
+        this.holdMs = holdMs;
+        this.owners = new Map();  // deviceId -> { receiver, at }
+    }
+
+    claim(deviceId, receiver) {
+        const now = performance.now();
+        const owner = this.owners.get(deviceId);
+        if (owner && owner.receiver !== receiver && now - owner.at < this.holdMs) {
+            return false;
+        }
+        this.owners.set(deviceId, { receiver, at: now });
+        return true;
+    }
+}
+const perParticipantAudioOwner = new PerParticipantAudioOwner();
+
 const handleAudioTrack = async (event) => {
   let lastAudioFormat = null;  // Track last seen format
   
@@ -2216,9 +2264,35 @@ const handleAudioTrack = async (event) => {
                     return;
                 }
 
-                const contributingSources = receiverManager.getContributingSources(receiver);
-
-                const usersForContributingSourcesWithAudioLevel = contributingSources.map(source => {
+                // lanh patch: label the frame by who is contributing to this
+                // receiver *now*, not by the loudest source in its history.
+                //
+                // getContributingSources() returns every source heard on the
+                // receiver in the last ten seconds, and the cached copy above
+                // is refreshed only when Meet's own UI polls it. Taking the
+                // loudest of that list labelled every frame of a receiver with
+                // whoever had spoken on it most loudly in the last ten seconds,
+                // whatever it was forwarding at that moment — so one speaker
+                // was stamped on two or three receivers at once and arrived
+                // downstream at up to two and a half times real time, mostly as
+                // another receiver's quiet audio under their name. Measured on
+                // a four-person call on 2026-09-14: the total across all
+                // labels sat at exactly three receivers' worth of frames while
+                // one participant carried 1.13x real time over the call and
+                // 2.5x in places.
+                //
+                // Read live, so a frame's sources are current, then keep only
+                // those heard within a few packets of the newest, and take the
+                // loudest of *those*. If one participant is still chosen on
+                // two receivers in the same instant, only the receiver that
+                // sent them last keeps sending — a participant has one voice.
+                const contributingSources = currentContributingSources(receiver);
+                const newestTimestamp = contributingSources.reduce(
+                    (max, source) => Math.max(max, source?.timestamp || 0), 0
+                );
+                const usersForContributingSourcesWithAudioLevel = contributingSources.filter(source => {
+                    return (source?.timestamp || 0) >= newestTimestamp - CONTRIBUTING_SOURCE_RECENCY_MS;
+                }).map(source => {
                     return {
                         audioLevel: source?.audioLevel || 0, 
                         user: userManager.getUserByStreamId(source.source.toString())
@@ -2227,15 +2301,10 @@ const handleAudioTrack = async (event) => {
 
                 const userForContributingSourceWithLoudestAudio = usersForContributingSourcesWithAudioLevel[0]?.user;
 
-
-                //console.log('contributingSources', contributingSources);
-                //console.log('deviceOutputMap', userManager.deviceOutputMap);
-                //console.log('usersForContributingSources', usersForContributingSources);
-
                 // Send audio data through websocket
                 if (userForContributingSourceWithLoudestAudio) {
                     const firstUserId = userForContributingSourceWithLoudestAudio?.deviceId;
-                    if (firstUserId) {
+                    if (firstUserId && perParticipantAudioOwner.claim(firstUserId, receiver)) {
                         ws.sendPerParticipantAudio(firstUserId, audioData);
                     }
                 }
