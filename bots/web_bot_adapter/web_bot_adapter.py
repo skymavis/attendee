@@ -125,6 +125,8 @@ class WebBotAdapter(BotAdapter):
 
         self.should_create_debug_recording = should_create_debug_recording
         self.debug_screen_recorder = None
+        # lanh patch: the Xvfb init() starts, so cleanup() can stop it.
+        self.display = None
 
         self.silence_detection_activated = False
         self.joined_at = None
@@ -1211,6 +1213,22 @@ class WebBotAdapter(BotAdapter):
 
         if self.debug_screen_recorder:
             self.debug_screen_recorder.stop()
+
+        # lanh patch: stop the virtual display. Upstream never does, because it
+        # runs one bot per pod and the pod's exit takes Xvfb with it. Here bots
+        # are celery tasks in one long-lived container: the worker child exits
+        # after each bot, Xvfb is reparented to the container's init, and it
+        # runs until the container restarts. Hundreds accumulated over weeks
+        # until a new Xvfb could no longer start, and every bot then died before
+        # reaching the lobby. Stopping also reaps an Xvfb whose start timed out,
+        # since pyvirtualdisplay counts the display as started before it spawns
+        # the process.
+        if self.display:
+            try:
+                self.display.stop()
+            except Exception as e:
+                logger.warning(f"Error stopping virtual display: {e}")
+            self.display = None
 
         # Properly shutdown the websocket server
         if self.websocket_server:

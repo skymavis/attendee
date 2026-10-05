@@ -56,6 +56,13 @@ there from a stack trace finds the reason without consulting this file.
   Verifiable on any call from the consumer's side: per-participant frames per
   minute must not exceed real time while the total across labels stays at
   three receivers' worth. Likely upstreamable.
+- **`fix(bots)`: `cleanup()` stops the virtual display.** Upstream starts an
+  Xvfb per bot and never stops it, which is harmless with one bot per pod.
+  Here every bot's Xvfb outlived its worker child and ran until the container
+  restarted; about three hundred piled up over a month, a new one could no
+  longer start, and every bot then died with `No reply from program Xvfb`
+  before reaching the lobby. Verifiable on the host: once no bot is running,
+  `ps -eo cmd | grep -c '^Xvfb'` is zero. Upstreamable.
 
 ## Deploying
 
